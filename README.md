@@ -115,18 +115,6 @@ Replace `COM3` with your actual port (`/dev/ttyUSBx` on Linux/Mac).
 3. Select board settings above
 4. **Sketch → Export Compiled Binary** to get a `.bin`, or just **Upload** directly
 
----
-
-## Known Issues
-
-| Issue | Details |
-|-------|---------|
-| `2Pi^2` gives `~39.48` instead of `~19.74` | Implicit multiplication binds tighter than `^`. Use `2*Pi^2` as a workaround. |
-| Quadratic equations not supported | `x^2 = 4` will give a wrong answer. The solver is linear-only. Planned for v1.1. |
-| Variable name collision | Don't use `e` as a variable name — it's reserved for Euler's number. Single-letter variables like `x`, `y`, `n` work fine. |
-
----
-
 ## License
 
 MIT — do whatever you want, just don't claim you wrote it from scratch.
