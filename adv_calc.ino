@@ -17,7 +17,7 @@
 #include <SD.h>
 #include <math.h>
 
-#define FW_VERSION  "v1.1"
+#define FW_VERSION  "v1.2"
 
 // ─────────────────────────────────────────────
 //  Colour palette  (RGB565)
@@ -76,6 +76,15 @@ bool   menuActive = false;
 bool   helpActive = false;
 int    mIdx       = 0;
 int    tabIdx     = 0;
+bool   converterMode = false;
+
+String convInput = "";
+int    convCursor = 0;
+int    convWinStart = 0;
+int    convTabIdx = 0;
+int    convMenuIdx = 0;
+int    convFirstTab = -1;
+int    convFirstIdx = -1;
 
 bool   degMode    = false;   // false = RAD, true = DEG
 
@@ -148,6 +157,32 @@ MenuTab menuTabs[] = {
 const int TAB_COUNT = sizeof(menuTabs) / sizeof(menuTabs[0]);
 
 // ─────────────────────────────────────────────
+//  Unit converter
+//  scale is the value in the category's base unit (metre, kilogram, litre,
+//  second). Temperature uses its own conversion formula.
+// ─────────────────────────────────────────────
+enum ConvKind { CONV_LENGTH, CONV_MASS, CONV_TEMP, CONV_VOLUME, CONV_TIME };
+struct ConvUnit { const char* label; double scale; };
+struct ConvTab {
+    const char* title;
+    ConvUnit units[6];
+    int count;
+    ConvKind kind;
+};
+
+ConvTab convTabs[] = {
+    { "Length", {{"KM",1000}, {"M",1}, {"CM",0.01}, {"MM",0.001}, {"MI",1609.344}, {"FT",0.3048}}, 6, CONV_LENGTH },
+    { "Mass",   {{"KG",1}, {"G",0.001}, {"LB",0.45359237}, {"OZ",0.028349523}}, 4, CONV_MASS },
+    { "Temp",   {{"C",0}, {"F",0}, {"K",0}}, 3, CONV_TEMP },
+    { "Volume", {{"L",1}, {"ML",0.001}, {"GAL",3.785411784}}, 3, CONV_VOLUME },
+    { "Time",   {{"S",1}, {"MIN",60}, {"H",3600}, {"DAY",86400}}, 4, CONV_TIME },
+};
+const int CONV_TAB_COUNT = sizeof(convTabs) / sizeof(convTabs[0]);
+ConvUnit convFrom = {"KM", 1000};
+ConvUnit convTo   = {"M", 1};
+ConvKind convKind = CONV_LENGTH;
+
+// ─────────────────────────────────────────────
 //  Forward declarations
 // ─────────────────────────────────────────────
 void drawInterface();
@@ -157,9 +192,15 @@ void drawDropdown();
 void redrawMenu();
 void drawStatus();
 void updateExprLine();
+void drawConverterBase();
+void updateConverter();
+void drawConverterMenu();
+void redrawConverterMenu();
 String solveExpression(String expr);
 void doBackspace();
 void insertText(const String& s, int cursorOffset);
+void convBackspace();
+void convInsertText(const String& s, int cursorOffset);
 
 // ─────────────────────────────────────────────
 //  Expression parser (recursive descent)
@@ -201,7 +242,7 @@ struct Parser {
 
 bool Parser::matchWord(const char* word) {
     int len = strlen(word);
-    if (strncasecmp(s + pos, word, len) == 0) {
+    if (strncmp(s + pos, word, len) == 0) {
         char next = s[pos + len];
         if (!isalpha(next) && next != '_') {
             pos += len;
@@ -252,22 +293,22 @@ double Parser::parsePrimary() {
 
     if (isalpha(c)) {
         int start = pos;
-        if (matchWord("pi"))    return M_PI;
-        if (matchWord("ans")) { if (hasAns) return lastAns; failAt(start); return NAN; }
-        if (matchWord("sin"))   return parseFunc("sin");
-        if (matchWord("cos"))   return parseFunc("cos");
-        if (matchWord("tan"))   return parseFunc("tan");
-        if (matchWord("rad"))   return parseFunc("rad");
-        if (matchWord("sqrt"))  return parseFunc("sqrt");
-        if (matchWord("log"))   return parseFunc("log");
-        if (matchWord("ln"))    return parseFunc("ln");
-        if (matchWord("abs"))   return parseFunc("abs");
-        if (matchWord("floor")) return parseFunc("floor");
-        if (matchWord("ceil"))  return parseFunc("ceil");
-        if (matchWord("round")) return parseFunc("round");
-        if (matchWord("gcd"))   return parseFunc("gcd");
-        if (matchWord("lcm"))   return parseFunc("lcm");
-        if (matchWord("e"))     return M_E;
+        if (matchWord("Pi"))    return M_PI;
+        if (matchWord("Ans")) { if (hasAns) return lastAns; failAt(start); return NAN; }
+        if (matchWord("Sin"))   return parseFunc("sin");
+        if (matchWord("Cos"))   return parseFunc("cos");
+        if (matchWord("Tan"))   return parseFunc("tan");
+        if (matchWord("Rad"))   return parseFunc("rad");
+        if (matchWord("Sqrt"))  return parseFunc("sqrt");
+        if (matchWord("Log"))   return parseFunc("log");
+        if (matchWord("Ln"))    return parseFunc("ln");
+        if (matchWord("Abs"))   return parseFunc("abs");
+        if (matchWord("Floor")) return parseFunc("floor");
+        if (matchWord("Ceil"))  return parseFunc("ceil");
+        if (matchWord("Round")) return parseFunc("round");
+        if (matchWord("Gcd"))   return parseFunc("gcd");
+        if (matchWord("Lcm"))   return parseFunc("lcm");
+        if (matchWord("E"))     return M_E;
         // Unknown identifier → hard error (never silently dropped)
         while (isalpha(s[pos])) pos++;
         failAt(start);
@@ -560,9 +601,9 @@ static double subEval2(const String& s, char v1, double a, char v2, double b) {
 // Known words (not variables)
 static bool isKnownWord(const String& w) {
     static const char* words[] = {
-        "pi", "e", "ans", "sin", "cos", "tan", "rad", "sqrt",
-        "log", "ln", "abs", "floor", "ceil", "round",
-        "gcd", "lcm", "factor", nullptr
+        "Pi", "E", "Ans", "Sin", "Cos", "Tan", "Rad", "Sqrt",
+        "Log", "Ln", "Abs", "Floor", "Ceil", "Round",
+        "Gcd", "Lcm", "Factor", nullptr
     };
     for (int i = 0; words[i]; i++)
         if (w == words[i]) return true;
@@ -581,9 +622,8 @@ static int findVars(const String& s, char* out, int maxOut) {
             int j = i;
             while (j < len && isalpha(s[j])) j++;
             String run = s.substring(i, j);
-            run.toLowerCase();
             if (isKnownWord(run)) { i = j; continue; }
-            if (run.length() == 1) {
+            if (run.length() == 1 && islower(run[0])) {
                 char v = run[0];
                 bool seen = false;
                 for (int k = 0; k < n; k++) if (out[k] == v) seen = true;
@@ -934,7 +974,7 @@ void drawBase() {
     d.setTextSize(1);
     d.setFont(&fonts::Font0);
     d.setTextDatum(TL_DATUM);
-    d.drawString("OK solve | hold DEL", 3, Y_INFO + 5);
+    d.drawString("OK solve | DEL hold | TAB conv", 3, Y_INFO + 5);
     drawStatus();
     updateExprLine();
 }
@@ -1000,7 +1040,7 @@ void drawStatus() {
 
     // The title and history rows stay dedicated to expressions.  Mode and
     // battery status belong with the keyboard bindings in the lower bar.
-    d.fillRect(164, Y_INFO + 1, SCR_W - 164, SCR_H - Y_INFO - 1, C_BAR);
+    d.fillRect(204, Y_INFO + 1, SCR_W - 204, SCR_H - Y_INFO - 1, C_BAR);
     d.setTextColor(C_GRAY);
     d.setTextSize(1);
     d.setFont(&fonts::Font0);
@@ -1062,6 +1102,106 @@ void updateExprLine() {
 }
 
 // ─────────────────────────────────────────────
+//  Converter drawing and input
+// ─────────────────────────────────────────────
+double convertValue(double value) {
+    if (convKind != CONV_TEMP) return value * convFrom.scale / convTo.scale;
+
+    double celsius;
+    if (!strcmp(convFrom.label, "C")) celsius = value;
+    else if (!strcmp(convFrom.label, "F")) celsius = (value - 32.0) * 5.0 / 9.0;
+    else celsius = value - 273.15;
+
+    if (!strcmp(convTo.label, "C")) return celsius;
+    if (!strcmp(convTo.label, "F")) return celsius * 9.0 / 5.0 + 32.0;
+    return celsius + 273.15;
+}
+
+void drawConverterBase() {
+    auto& d = M5Cardputer.Display;
+    d.fillScreen(C_BG);
+    drawTitle();
+    d.fillRect(0, Y_INFO, SCR_W, SCR_H - Y_INFO, C_BAR);
+    d.setTextColor(C_WHITE);
+    d.setTextSize(1);
+    d.setFont(&fonts::Font0);
+    d.setTextDatum(TL_DATUM);
+    d.drawString("TAB calc | Fn units | DEL erase", 3, Y_INFO + 5);
+    updateConverter();
+}
+
+void updateConverter() {
+    canvas.fillSprite(C_BG);
+    canvas.setTextSize(1);
+    canvas.setTextDatum(TL_DATUM);
+    canvas.setFont(&fonts::FreeSansBold12pt7b);
+
+    // Input row: source unit and editable number.
+    canvas.setTextColor(C_WHITE);
+    canvas.drawString(convFrom.label, 10, 32 - CANVAS_Y);
+    int inputX = 58;
+    if (convCursor < convWinStart) convWinStart = convCursor;
+    if (convCursor > convWinStart + MAXVIS - 1) convWinStart = convCursor - MAXVIS + 1;
+    int end = min((int)convInput.length(), convWinStart + MAXVIS);
+    String visible = convInput.substring(convWinStart, convCursor)
+                   + (cursorOn ? "|" : " ")
+                   + convInput.substring(convCursor, end);
+    canvas.setTextColor(C_WHITE);
+    canvas.drawString(visible, inputX, 32 - CANVAS_Y);
+
+    // A central divider separates the editable value from the converted one.
+    const int mid = 67;
+    canvas.drawLine(8, mid - CANVAS_Y, SCR_W - 9, mid - CANVAS_Y, C_LINE);
+
+    canvas.setTextColor(C_WHITE);
+    canvas.drawString(convTo.label, 10, 86 - CANVAS_Y);
+    if (convInput.length() > 0) {
+        double value = evalCalc(convInput);
+        canvas.setTextColor(isnan(value) ? C_GRAY : C_WHITE);
+        canvas.drawString(isnan(value) ? "error" : fmtVal(convertValue(value)), inputX, 86 - CANVAS_Y);
+    }
+    canvas.pushSprite(0, CANVAS_Y);
+}
+
+void drawConverterMenu() {
+    auto& d = M5Cardputer.Display;
+    ConvTab& t = convTabs[convTabIdx];
+    const int x = 128, y = 19, w = 108;
+    const int h = 18 + t.count * 11 + 4;
+    d.fillRect(x, y, w, h, C_BAR);
+    d.drawRect(x, y, w, h, C_WHITE);
+    d.setFont(&fonts::FreeSans9pt7b);
+    d.setTextColor(C_GREEN);
+    char title[24];
+    snprintf(title, sizeof(title), "<%s %d/%d>", t.title, convTabIdx + 1, CONV_TAB_COUNT);
+    d.drawString(title, x + 5, y + 4);
+    for (int i = 0; i < t.count; i++) {
+        bool first = (convFirstTab == convTabIdx && convFirstIdx == i);
+        d.setTextColor(first ? C_GRAY : (i == convMenuIdx ? C_GREEN : C_WHITE));
+        d.drawString(t.units[i].label, x + 5, y + 18 + i * 11);
+    }
+}
+
+void redrawConverterMenu() {
+    drawConverterBase();
+    drawConverterMenu();
+}
+
+void convInsertText(const String& s, int cursorOffset) {
+    convInput = convInput.substring(0, convCursor) + s + convInput.substring(convCursor);
+    convCursor += cursorOffset;
+    updateConverter();
+}
+
+void convBackspace() {
+    if (convCursor > 0) {
+        convInput = convInput.substring(0, convCursor - 1) + convInput.substring(convCursor);
+        convCursor--;
+    }
+    updateConverter();
+}
+
+// ─────────────────────────────────────────────
 //  Input helpers
 // ─────────────────────────────────────────────
 void insertText(const String& s, int cursorOffset) {
@@ -1109,6 +1249,7 @@ void setup() {
 
 bool prevFn  = false;
 bool prevOpt = false;
+bool prevTab = false;
 
 void loop() {
     M5Cardputer.update();
@@ -1124,7 +1265,8 @@ void loop() {
     if (delHeld && !sleeping && !menuActive && !helpActive) {
         if (now - delStart > DEL_DELAY_MS && now - delRepeat > DEL_REPEAT_MS) {
             delRepeat = now;
-            doBackspace();
+            if (converterMode) convBackspace();
+            else               doBackspace();
         }
     }
 
@@ -1132,7 +1274,10 @@ void loop() {
     if (now - lastBlink >= BLINK_MS) {
         lastBlink = now;
         cursorOn  = !cursorOn;
-        if (!menuActive && !helpActive && !sleeping) updateExprLine();
+        if (!menuActive && !helpActive && !sleeping) {
+            if (converterMode) updateConverter();
+            else               updateExprLine();
+        }
     }
 
     // ── Battery refresh (every 30 s) ──
@@ -1140,8 +1285,11 @@ void loop() {
         lastBattCheck = now;
         batteryLevel = M5Cardputer.Power.getBatteryLevel();
         drawTitle();
-        drawStatus();
-        updateExprLine();   // mode/battery live in the canvas top row
+        if (converterMode) updateConverter();
+        else {
+            drawStatus();
+            updateExprLine();
+        }
     }
 
     if (!M5Cardputer.Keyboard.isChange()) return;
@@ -1159,6 +1307,7 @@ void loop() {
         // All keys released
         prevFn  = false;
         prevOpt = false;
+        prevTab = false;
         delHeld = false;
         return;
     }
@@ -1170,6 +1319,7 @@ void loop() {
         helpActive = !helpActive;
         menuActive = false;
         if (helpActive) drawHelp();
+        else if (converterMode) drawConverterBase();
         else            drawBase();
         prevOpt = s.opt;
         delHeld = false;
@@ -1177,14 +1327,33 @@ void loop() {
     }
     prevOpt = s.opt;
 
-    if (helpActive) { prevFn = s.fn; delHeld = false; return; }
+    if (helpActive) { prevFn = s.fn; prevTab = s.tab; delHeld = false; return; }
+
+    // ── Tab: calculator ↔ unit converter ───────────────────
+    if (s.tab) {
+        if (!prevTab) {
+            converterMode = !converterMode;
+            menuActive = false;
+            if (converterMode) drawConverterBase();
+            else               drawBase();
+        }
+        prevTab = true;
+        delHeld = false;
+        return;
+    }
+    prevTab = false;
 
     // ── Fn layer: menu toggle ──────────────────────────────
     if (s.fn) {
         if (!prevFn) {
             menuActive = !menuActive;
-            if (menuActive) { redrawMenu(); }
-            else            { drawBase(); }
+            if (menuActive) {
+                if (converterMode) redrawConverterMenu();
+                else               redrawMenu();
+            } else {
+                if (converterMode) drawConverterBase();
+                else               drawBase();
+            }
         }
         prevFn = true;
         delHeld = false;
@@ -1195,6 +1364,45 @@ void loop() {
     // ── Menu navigation ─────────────────────────────────────
     if (menuActive) {
         delHeld = false;
+        if (converterMode) {
+            ConvTab& t = convTabs[convTabIdx];
+            if (s.enter) {
+                if (convFirstTab != convTabIdx) {
+                    // First unit: retain it in gray while the second is chosen.
+                    convFirstTab = convTabIdx;
+                    convFirstIdx = convMenuIdx;
+                    redrawConverterMenu();
+                } else if (convFirstIdx != convMenuIdx) {
+                    convFrom = t.units[convFirstIdx];
+                    convTo   = t.units[convMenuIdx];
+                    convKind = t.kind;
+                    convFirstTab = convFirstIdx = -1;
+                    menuActive = false;
+                    drawConverterBase();
+                }
+            } else {
+                for (auto c : s.word) {
+                    if (c == ';') {
+                        convMenuIdx = (convMenuIdx - 1 + t.count) % t.count;
+                        redrawConverterMenu();
+                    } else if (c == '.') {
+                        convMenuIdx = (convMenuIdx + 1) % t.count;
+                        redrawConverterMenu();
+                    } else if (c == ',') {
+                        convTabIdx = (convTabIdx - 1 + CONV_TAB_COUNT) % CONV_TAB_COUNT;
+                        convMenuIdx = 0;
+                        convFirstTab = convFirstIdx = -1; // category changed
+                        redrawConverterMenu();
+                    } else if (c == '/') {
+                        convTabIdx = (convTabIdx + 1) % CONV_TAB_COUNT;
+                        convMenuIdx = 0;
+                        convFirstTab = convFirstIdx = -1; // category changed
+                        redrawConverterMenu();
+                    }
+                }
+            }
+            return;
+        }
         if (s.enter) {
             MenuTab& t = menuTabs[tabIdx];
             MenuItem& it = t.items[mIdx];
@@ -1237,6 +1445,40 @@ void loop() {
     }
 
     // ── Normal input ────────────────────────────────────────
+
+    if (converterMode) {
+        if (s.del) {
+            delHeld = true;
+            delStart = now;
+            delRepeat = now;
+            convBackspace();
+            return;
+        }
+        delHeld = false;
+
+        // Conversion is live; Enter simply refreshes the displayed value.
+        if (s.enter) { updateConverter(); return; }
+
+        for (auto c : s.word) {
+            if (c == ',') {
+                if (convCursor > 0) convCursor--;
+                updateConverter();
+                continue;
+            }
+            if (c == '/') {
+                if (convCursor < (int)convInput.length()) convCursor++;
+                updateConverter();
+                continue;
+            }
+            if (c == '?') { convInsertText("/", 1); continue; }
+            if (c == '>') { convInsertText(".", 1); continue; }
+            if (isdigit(c) || c == '+' || c == '-' || c == '*' ||
+                c == '^' || c == '(' || c == ')' || c == ' ') {
+                convInsertText(String(c), 1);
+            }
+        }
+        return;
+    }
 
     // Backspace (starts auto-repeat)
     if (s.del) {
